@@ -74,7 +74,7 @@ function boot(saved = null, storageError = false) {
   assert.equal(env.options().filter((input) => input.disabled).length, 2);
   env.select('email', false); await env.click('account-columns-cancel'); assert(env.headers().includes('email')); assert.equal(env.writes.length, 0);
   await env.click('accounts-columns'); await env.click('account-columns-all');
-  assert.equal(env.headers().length, 11); await env.apply(); assert.equal(env.headers().length, 15);
+  assert.equal(env.headers().length, 11); await env.apply(); assert.equal(env.headers().length, 16);
   assert.equal(env.get('account-columns-dialog').open, false);
   assert.deepEqual(JSON.parse(env.stored()), env.headers().filter((id) => !['identity', 'actions'].includes(id)));
   assert(!env.stored().includes(syntheticEmail)); assert(!env.stored().includes(A));
@@ -83,7 +83,7 @@ function boot(saved = null, storageError = false) {
   await env.click(env.rows()[0].querySelectorAll('[data-focus-key]').find((item) => item.dataset.focusKey === `details:${A}`));
   assert.equal(env.get('accounts-rows').querySelectorAll('.account-detail-row')[0].children[0].colSpan, 15);
   await env.click('accounts-columns'); await env.click('account-columns-default');
-  assert.equal(env.headers().length, 15);
+  assert.equal(env.headers().length, 16);
   env.intervals.find((item) => item.ms === 5000).fn(); await flush();
   assert.equal(env.options().find((item) => item.dataset.columnOption === 'luna').checked, false);
   await env.apply(); assert.equal(env.headers().length, 11);

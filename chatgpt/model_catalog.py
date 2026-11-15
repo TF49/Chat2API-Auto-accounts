@@ -251,6 +251,40 @@ class ModelCatalog:
         self._spacing = max(0, float(refresh_spacing))
         self._task = None
         self._persistence_error = False
+        self._probes = {}
+
+    def set_probe_state(self, account_id, **fields):
+        """In-memory progress of an administrator probe job; never persisted."""
+        if not isinstance(account_id, str) or not _ACCOUNT_ID.fullmatch(account_id):
+            raise ValueError("Invalid account identifier")
+        current = self._probes.get(account_id, {})
+        self._probes = {**self._probes, account_id: {**current, **fields}}
+        return self._probes[account_id]
+
+    def get_probe_state(self, account_id):
+        value = self._probes.get(account_id)
+        return dict(value) if value is not None else None
+
+    def probe_candidates(self, account_id, limit=MAX_MODELS):
+        """Ordered chat slugs worth probing on one account.
+
+        Own directory first, then slugs other accounts list or have verified
+        (an account may accept models its directory omits), then the default.
+        """
+        now = self._clock()
+        self._load(now)
+        groups = self._groups()
+        own = self._record(account_id, groups)
+        ordered = [*own["models"], DEFAULT_CHAT_MODEL]
+        for key in groups:
+            if key == account_id:
+                continue
+            row = self._record(key, groups)
+            ordered.extend(row["models"])
+            ordered.extend(model for model, check in row["checks"].items() if check.get("status") == "verified")
+        if self._usable(self._legacy_at, now):
+            ordered.extend(self._legacy_models)
+        return [model for model in dict.fromkeys(ordered) if is_chat_model_id(model)][:max(0, int(limit))]
 
     def _groups(self):
         groups = {}
@@ -328,7 +362,8 @@ class ModelCatalog:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
             fd, temporary = tempfile.mkstemp(prefix=".model_catalog-", dir=self._cache_path.parent)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                os.fchmod(handle.fileno(), 0o600)
+                if hasattr(os, "fchmod"):  # Not available on Windows
+                    os.fchmod(handle.fileno(), 0o600)
                 json.dump({"version": 2, "last_refresh_at": self._last_refresh_at,
                            "accounts": {key: {CHANNEL: row} for key, row in self._records.items()},
                            "legacy": {"models": self._legacy_models, "checked_at": self._legacy_at}}, handle)
@@ -408,9 +443,14 @@ class ModelCatalog:
             checks.setdefault("gpt-6-luna", {"status": "unverified", "checked_at": None,
                 "requested_model": "gpt-6-luna", "sent_model": None, "reported_model": None,
                 "http_status": None, "error_code": None, "stale": False})
+            current = {model: check for model, check in checks.items() if not check["stale"]}
+            available = [model for model, check in current.items() if check["status"] == "verified"]
+            unavailable = [model for model, check in current.items() if check["status"] in {"denied", "model_mismatch"}]
             accounts.append({"account_id": key, "channel": CHANNEL, "status": status,
                 "checked_at": _iso(row["checked_at"]), "last_success_at": _iso(success),
                 "models": list(row["models"]), "checks": checks,
+                "available_models": available, "unavailable_models": unavailable,
+                "probe": self.get_probe_state(key),
                 "discovery_available": bool(group["available_tokens"]),
                 "error_code": row["error_code"] if group["available_tokens"] else "credentials_unavailable"})
         return {"accounts": accounts, "refreshing": self._lock.locked() or bool(self._task and not self._task.done()),
@@ -608,3 +648,15 @@ def account_supports_model(account_id, model, channel=CHANNEL):
 
 def record_model_check(account_id, model, status, **kwargs):
     return _catalog.record_model_check(account_id, model, status, **kwargs)
+
+
+def probe_candidates(account_id, limit=MAX_MODELS):
+    return _catalog.probe_candidates(account_id, limit)
+
+
+def set_probe_state(account_id, **fields):
+    return _catalog.set_probe_state(account_id, **fields)
+
+
+def get_probe_state(account_id):
+    return _catalog.get_probe_state(account_id)
