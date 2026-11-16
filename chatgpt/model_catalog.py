@@ -38,7 +38,13 @@ _CHECK_STATES = {"unverified", "verified", "denied", "error", "model_mismatch"}
 _ERROR_CODES = {"upstream_http", "invalid_response", "invalid_models", "invalid_config", "timeout",
                 "unavailable", "cancelled", "model_not_found", "model_not_supported", "permission_denied",
                 "authentication_error", "rate_limit", "quota_exceeded", "model_mismatch", "incomplete_response",
-                "credentials_unavailable"}
+                "credentials_unavailable", "check_timeout", "check_failed", "no_available_account",
+                "account_concurrency_exhausted", "model_not_available"}
+_HTTP_ERROR = re.compile(r"http_[1-5][0-9]{2}\Z")
+_PROBE_STATES = {"queued", "discovering", "running", "completed", "stopped", "cancelled"}
+_PROBE_ACTIVE = {"queued", "discovering", "running"}
+_PROBE_REASON = re.compile(r"[a-z_]{1,64}\Z")
+_ISO = re.compile(r"[0-9T:.+\-Z]{10,40}\Z")
 _CHAT_ID = re.compile(r"(?:gpt-[a-z0-9][a-z0-9._-]*|o[134](?:[-.][a-z0-9][a-z0-9._-]*)?)\Z")
 _NON_CHAT = re.compile(r"(?:image|research|codex|review)", re.IGNORECASE)
 _logger = logging.getLogger(__name__)
@@ -203,6 +209,29 @@ def _empty_record(fingerprint):
             "error_code": None, "checks": {}}
 
 
+def _error_code(value):
+    return value if isinstance(value, str) and (value in _ERROR_CODES or _HTTP_ERROR.fullmatch(value)) else None
+
+
+def _safe_probe(value):
+    """Allowlisted probe progress; an active job from a previous process is interrupted."""
+    if not isinstance(value, dict) or value.get("status") not in _PROBE_STATES:
+        return None
+    number = lambda item: item if type(item) is int and 0 <= item <= MAX_MODELS else 0
+    stamp = lambda item: item if isinstance(item, str) and _ISO.fullmatch(item) else None
+    models = lambda items: [m for m in items if is_chat_model_id(m)][:MAX_MODELS] if isinstance(items, list) else []
+    results = value.get("results") if isinstance(value.get("results"), dict) else {}
+    reason = value.get("stop_reason")
+    probe = {"status": value["status"], "stop_reason": reason if isinstance(reason, str) and _PROBE_REASON.fullmatch(reason) else None,
+             "models": models(value.get("models")), "skipped": models(value.get("skipped")),
+             "total": number(value.get("total")), "done": number(value.get("done")),
+             "current": value.get("current") if is_chat_model_id(value.get("current")) else None,
+             "results": {m: s for m, s in list(results.items())[:MAX_MODELS] if is_chat_model_id(m) and s in _CHECK_STATES},
+             "queued_at": stamp(value.get("queued_at")), "started_at": stamp(value.get("started_at")),
+             "finished_at": stamp(value.get("finished_at"))}
+    return probe
+
+
 def _safe_check(model, value, now):
     if not is_chat_model_id(model) or not isinstance(value, dict) or value.get("status") not in _CHECK_STATES:
         return None
@@ -217,7 +246,7 @@ def _safe_check(model, value, now):
     http = value.get("http_status")
     return {"status": status, "checked_at": stamp, "requested_model": model, "sent_model": sent,
             "reported_model": reported, "http_status": http if type(http) is int and 100 <= http <= 599 else None,
-            "error_code": value.get("error_code") if value.get("error_code") in _ERROR_CODES else None}
+            "error_code": _error_code(value.get("error_code"))}
 
 
 class ModelCatalog:
@@ -254,12 +283,17 @@ class ModelCatalog:
         self._probes = {}
 
     def set_probe_state(self, account_id, **fields):
-        """In-memory progress of an administrator probe job; never persisted."""
+        """Administrator probe progress; persisted so a restart shows an interrupted job."""
         if not isinstance(account_id, str) or not _ACCOUNT_ID.fullmatch(account_id):
             raise ValueError("Invalid account identifier")
+        self._load(self._clock())
         current = self._probes.get(account_id, {})
-        self._probes = {**self._probes, account_id: {**current, **fields}}
-        return self._probes[account_id]
+        probe = _safe_probe({**current, **fields})
+        if probe is None:
+            raise ValueError("Invalid probe state")
+        self._probes = {**self._probes, account_id: probe}
+        self._persist()
+        return probe
 
     def get_probe_state(self, account_id):
         value = self._probes.get(account_id)
@@ -345,6 +379,17 @@ class ModelCatalog:
                                 "checks": {model: safe for model, check in list(checks.items())[:MAX_MODELS]
                                            if (safe := _safe_check(model, check, now))} if isinstance(checks, dict) else {}}
             self._records = records
+            loaded = {}
+            probes = saved.get("probes", {})
+            for key, value in list(probes.items() if isinstance(probes, dict) else ())[:MAX_ACCOUNTS]:
+                probe = _safe_probe(value) if _ACCOUNT_ID.fullmatch(str(key)) else None
+                if probe is not None:
+                    if probe["status"] in _PROBE_ACTIVE:
+                        # The worker belonged to an earlier process and no longer runs.
+                        probe = {**probe, "status": "stopped", "stop_reason": "interrupted", "current": None}
+                    loaded[key] = probe
+            # In-memory jobs of this process take precedence over the file.
+            self._probes = {**loaded, **self._probes}
             self._last_refresh_at = _timestamp(saved.get("last_refresh_at"), now)
             legacy = saved.get("legacy", {})
             if isinstance(legacy, dict):
@@ -366,6 +411,7 @@ class ModelCatalog:
                     os.fchmod(handle.fileno(), 0o600)
                 json.dump({"version": 2, "last_refresh_at": self._last_refresh_at,
                            "accounts": {key: {CHANNEL: row} for key, row in self._records.items()},
+                           "probes": self._probes,
                            "legacy": {"models": self._legacy_models, "checked_at": self._legacy_at}}, handle)
                 handle.flush()
                 os.fsync(handle.fileno())

@@ -75,7 +75,7 @@
     {id: 'updated_at', label: '上游更新', width: 160},
     {id: 'actions', label: '操作', width: 188, fixed: true},
   ];
-  const defaultColumns = ['email', 'plan', 'authorization', 'reason_remaining', 'reason_reset', 'image_remaining', 'image_reset', 'concurrency', 'requests_24h'];
+  const defaultColumns = ['email', 'plan', 'authorization', 'reason_remaining', 'reason_reset', 'image_remaining', 'image_reset', 'concurrency', 'models', 'requests_24h'];
   const columnStorageKey = 'chat2api.accounts.columns.v1';
   const configurableColumns = columnDefinitions.filter((column) => !column.fixed).map((column) => column.id);
   const columnsDialog = byId('account-columns-dialog');
@@ -256,9 +256,8 @@
   const probeStopLabels = {
     rate_limit: '上游限流，已停止以免继续消耗额度', authentication_error: '上游认证失败', credentials_unavailable: '账号凭据不可用',
     account_removed: '账号已被移除', no_available_account: '大模型额度不足或已用尽', account_concurrency_exhausted: '账号并发已满，请稍后重试',
-    concurrency_configuration_unavailable: '并发配置暂不可用', probe_failed: '探测异常中止', cancelled: '已手动取消',
+    concurrency_configuration_unavailable: '并发配置暂不可用', probe_failed: '探测异常中止', cancelled: '已手动取消', interrupted: '服务重启导致探测中断，可继续探测',
   };
-  const checkStatusLabels = {verified: '可用', model_mismatch: '被替换为其他模型', denied: '被拒绝', error: '失败', unverified: '未探测'};
   function modelIds(values) { return Array.isArray(values) ? values.filter((id) => typeof id === 'string' && modelIdPattern.test(id)) : []; }
   function probeState(account) { const probe = accountCatalog(account).probe; return probe && typeof probe === 'object' ? probe : null; }
   function probeActive(account) { return ['queued', 'discovering', 'running'].includes(probeState(account)?.status); }
@@ -278,35 +277,84 @@
     content.title = `可用：${available.join(', ') || '无'}；不可用：${unavailable.join(', ') || '无'}。可用 = 实际调用成功且上游报告的模型与请求一致。`;
     return content;
   }
-  function modelProbeDetails(account) {
-    const box = section('模型探测'), catalog = accountCatalog(account), probe = probeState(account), active = probeActive(account);
-    const available = modelIds(catalog.available_models), unavailable = modelIds(catalog.unavailable_models);
-    box.append(definition([['可用模型', available.join(' · ') || '尚无'], ['不可用模型', unavailable.join(' · ') || '尚无'],
-      ['探测状态', probe ? probeSummary(account) : '尚未探测'], ['完成时间', probe?.finished_at ? dateText(probe.finished_at) : null]]));
-    const checks = catalog.checks && typeof catalog.checks === 'object' ? Object.entries(catalog.checks).filter(([id, check]) => modelIdPattern.test(id) && check && check.status !== 'unverified') : [];
-    if (checks.length) {
-      const list = el('ul', 'model-probe-list');
-      checks.forEach(([id, check]) => {
-        const item = el('li', 'model-probe-item'); item.dataset.status = check.stale ? 'stale' : check.status;
-        const detail = check.status === 'model_mismatch' && modelIdPattern.test(check.reported_model || '') ? ` → ${check.reported_model}` : check.http_status ? ` · HTTP ${check.http_status}` : '';
-        item.append(el('span', 'detail-code', id), el('span', 'quota-note', `${checkStatusLabels[check.status] || check.status}${detail}${check.stale ? ' · 已过期' : ''} · ${dateText(check.checked_at)}`));
-        list.append(item);
-      });
-      box.append(list);
+  const chipKinds = {verified: {mark: '✓', label: '可用'}, probing: {mark: '…', label: '正在探测'}, untested: {mark: '·', label: '未探测'},
+    error: {mark: '!', label: '探测失败'}, unusable: {mark: '✗', label: '不可用'}};
+  const chipOrder = {verified: 0, probing: 1, untested: 2, error: 3, unusable: 4};
+  const checkErrorLabels = {check_timeout: '请求超时', check_failed: '请求失败', no_available_account: '额度不足', account_concurrency_exhausted: '并发已满',
+    credentials_unavailable: '凭据不可用', model_not_available: '模型不可用', timeout: '请求超时'};
+  function checkErrorText(check) {
+    const code = check?.error_code;
+    if (typeof code === 'string' && /^http_\d{3}$/.test(code)) return `HTTP ${code.slice(5)}`;
+    return checkErrorLabels[code] || (check?.http_status ? `HTTP ${check.http_status}` : '原因未记录');
+  }
+  function modelEntries(account) {
+    const catalog = accountCatalog(account), checks = catalog.checks && typeof catalog.checks === 'object' ? catalog.checks : {};
+    const listed = new Set(modelIds(catalog.models)), current = probeActive(account) ? probeState(account)?.current : null;
+    const ids = [...new Set([...modelIds(catalog.available_models), ...listed, ...modelIds(Object.keys(checks))])];
+    return ids.map((id) => {
+      const check = checks[id] && typeof checks[id] === 'object' ? checks[id] : null;
+      let kind = 'untested';
+      if (id === current) kind = 'probing';
+      else if (check && !check.stale) kind = check.status === 'verified' ? 'verified' : ['denied', 'model_mismatch'].includes(check.status) ? 'unusable' : check.status === 'error' ? 'error' : 'untested';
+      return {id, kind, check, listed: listed.has(id)};
+    }).sort((left, right) => chipOrder[left.kind] - chipOrder[right.kind]);
+  }
+  function chipTitle(entry) {
+    const {check} = entry, when = check?.checked_at ? ` · ${dateText(check.checked_at)}` : '';
+    if (entry.kind === 'verified') return `${entry.id}：可用，上游报告的模型一致${when}`;
+    if (entry.kind === 'probing') return `${entry.id}：正在探测`;
+    if (entry.kind === 'unusable') return check.status === 'model_mismatch' ? `${entry.id}：不可用，上游实际返回 ${modelIdPattern.test(check.reported_model || '') ? check.reported_model : '其他模型'}${when}` : `${entry.id}：不可用，上游拒绝（${checkErrorText(check)}）${when}`;
+    if (entry.kind === 'error') return `${entry.id}：探测失败（${checkErrorText(check)}），再次探测会重试${when}`;
+    return `${entry.id}：未探测${check?.stale ? '（历史结果已超过 24 小时）' : ''}${entry.listed ? ' · 账号目录已列出' : ''}`;
+  }
+  function modelSection(account, full = false) {
+    const entries = modelEntries(account), box = el('div', 'model-chip-section'), active = probeActive(account);
+    const tally = Object.fromEntries(Object.keys(chipKinds).map((kind) => [kind, entries.filter((entry) => entry.kind === kind).length]));
+    const head = el('div', 'model-chip-head'), title = el('div', 'model-chip-title');
+    title.append(el('strong', '', `模型（${entries.length}）`), el('span', 'model-chip-counts', [`可用 ${tally.verified}`, `不可用 ${tally.unusable}`, tally.error ? `失败 ${tally.error}` : '', `未探测 ${tally.untested + tally.probing}`].filter(Boolean).join(' · ')));
+    const actions = el('div', 'model-chip-actions');
+    const start = el('button', 'button button-quiet', active ? '探测中…' : tally.verified + tally.unusable + tally.error ? '继续探测' : '探测');
+    start.type = 'button'; start.disabled = active || state.expired; start.dataset.focusKey = `probe-${full ? 'detail' : 'card'}:${account.id}`;
+    start.title = '逐个验证未探测或失败的模型，每个模型消耗 1 次大模型额度';
+    start.addEventListener('click', () => { void startProbe([account.id]); }); actions.append(start);
+    if (full && !active) {
+      const force = el('button', 'button button-quiet', '全部重新探测'); force.type = 'button'; force.disabled = state.expired;
+      force.addEventListener('click', () => { void startProbe([account.id], true); }); actions.append(force);
     }
-    const actions = el('div', 'model-probe-actions');
-    const start = el('button', 'button button-secondary', active ? '探测进行中…' : '探测可用模型');
-    start.type = 'button'; start.disabled = active || state.expired; start.dataset.focusKey = `probe-detail:${account.id}`;
-    start.addEventListener('click', () => { void startProbe([account.id]); });
-    const force = el('button', 'button button-quiet', '全部重新探测');
-    force.type = 'button'; force.disabled = active || state.expired;
-    force.addEventListener('click', () => { void startProbe([account.id], true); });
-    actions.append(start, force);
     if (active) {
-      const cancel = el('button', 'button button-quiet', '取消探测'); cancel.type = 'button'; cancel.disabled = state.expired;
+      const cancel = el('button', 'button button-quiet', '取消'); cancel.type = 'button'; cancel.disabled = state.expired;
       cancel.addEventListener('click', () => { void cancelProbe([account.id]); }); actions.append(cancel);
     }
-    box.append(actions, el('p', 'field-hint', '探测会对候选模型（本账号目录、其他账号目录中出现的模型及默认模型）各发送一条极短请求，每个模型消耗 1 次大模型额度；已有有效结论的模型默认跳过。遇到限流、认证失败或额度不足会自动停止。'));
+    head.append(title, actions); box.append(head);
+    if (!entries.length) {
+      box.append(el('p', 'model-chip-status', '尚未读取账号模型目录。点击「探测」会先读取目录，再逐个验证。'));
+      return box;
+    }
+    const key = `models:${account.id}`, expanded = full || state.disclosures.has(key), limit = 12;
+    const list = el('ul', 'model-chip-list');
+    (expanded ? entries : entries.slice(0, limit)).forEach((entry) => {
+      const chip = el('li', 'model-chip'); chip.dataset.kind = entry.kind; chip.title = chipTitle(entry);
+      chip.setAttribute('aria-label', `${entry.id}：${chipKinds[entry.kind].label}`);
+      const mark = el('span', 'model-chip-mark', chipKinds[entry.kind].mark); mark.setAttribute('aria-hidden', 'true');
+      chip.append(mark, el('span', 'model-chip-name', entry.id)); list.append(chip);
+    });
+    box.append(list);
+    if (!full && entries.length > limit) {
+      const toggle = el('button', 'button button-quiet model-chip-more', expanded ? '收起' : `展开全部 ${entries.length} 个`); toggle.type = 'button';
+      toggle.addEventListener('click', () => {
+        state = {...state, disclosures: expanded ? new Set([...state.disclosures].filter((item) => item !== key)) : new Set([...state.disclosures, key])};
+        renderRows();
+      });
+      box.append(toggle);
+    }
+    const probe = probeState(account);
+    const status = probe ? probeSummary(account) + (probe.finished_at && !active ? ` · ${dateText(probe.finished_at)}` : '') : '尚未探测：灰色模型仅来自目录，未经实际调用验证。';
+    const line = el('p', 'model-chip-status', status); line.dataset.state = probe?.status || 'none'; box.append(line);
+    return box;
+  }
+  function modelProbeDetails(account) {
+    const box = section('模型探测');
+    box.append(modelSection(account, true), el('p', 'field-hint', '✓ 可用：实际调用成功且上游报告的模型与请求一致；✗ 不可用：上游拒绝（403/404）或返回了其他模型；! 失败：超时等临时错误，再次探测会重试；· 未探测。候选模型来自本账号目录、其他账号目录及默认模型，每个模型消耗 1 次大模型额度，已有 24 小时内结论的模型默认跳过。遇到限流、认证失败或额度不足会自动停止。'));
     return box;
   }
   async function startProbe(ids, force = false) {
@@ -1027,7 +1075,7 @@
       // (a) Reason Metric
       const reasonBox = el('div', 'quota-metric-box');
       const reasonHead = el('div', 'quota-metric-head');
-      const reasonLabel = el('span', 'quota-metric-label', '🧠 大模型 / 高阶推理 (GPT-4o, o1)');
+      const reasonLabel = el('span', 'quota-metric-label', '🧠 大模型额度');
       const reasonRem = reasonFeat?.remaining;
       const reasonFinite = finite(reasonRem);
       const reasonAmount = el('span', 'quota-metric-amount', reasonFinite ? `${count(reasonRem)} 次可用` : '未知');
@@ -1049,7 +1097,7 @@
       // (b) Image Metric
       const imageBox = el('div', 'quota-metric-box');
       const imageHead = el('div', 'quota-metric-head');
-      const imageLabel = el('span', 'quota-metric-label', '🎨 AI 图像生成 (DALL-E 3)');
+      const imageLabel = el('span', 'quota-metric-label', '🎨 生图额度');
       const imageRem = imageFeat?.remaining;
       const imageFinite = finite(imageRem);
       const imageTotal = imageFeat?.total;
@@ -1132,6 +1180,8 @@
           imageReset.textContent = '重置时间未知';
         }
       });
+
+      card.append(modelSection(account));
 
       // 3. Footer
       const footer = el('div', 'quota-card-footer');

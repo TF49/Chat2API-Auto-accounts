@@ -129,8 +129,9 @@ async def _execute_check(account_id, group, model, request=None):
         raise HTTPException(504, "模型核查超时，未重试或切换模型；上游结果未知。") from None
     except HTTPException as error:
         code = f"http_{error.status_code}"
+        # 403/404 on an otherwise working account: this model is not granted.
         model_catalog.record_model_check(account_id, model,
-            "denied" if error.status_code == 404 else "error",
+            "denied" if error.status_code in {403, 404} else "error",
             sent_model=model, http_status=error.status_code, error_code=code)
         await metrics.finish("failed", error.status_code, code)
         return None

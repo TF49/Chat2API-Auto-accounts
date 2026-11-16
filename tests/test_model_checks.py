@@ -325,7 +325,7 @@ class ModelCheckTests(unittest.IsolatedAsyncioTestCase):
                 await self.scheduler.finish(lease, status="cancelled")
 
     async def test_http_not_found_is_denied_auth_and_quota_failures_are_errors_without_retry(self):
-        for upstream_status, expected in ((404, "denied"), (401, "error"), (403, "error"), (429, "error")):
+        for upstream_status, expected in ((404, "denied"), (403, "denied"), (401, "error"), (429, "error")):
             with self.subTest(upstream_status=upstream_status):
                 self.now += 61
                 self.process.reset_mock()
@@ -628,6 +628,42 @@ class ModelProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["accounts"][A]["available_models"], ["gpt-5", MODEL, "o3", "gpt-5-pro"])
         self.assertEqual(body["running"], [])
+
+    async def test_forbidden_model_is_unusable_with_reason_and_probe_continues(self):
+        async def forbidden(data, token, *, lease):
+            if data["model"] == "gpt-5":
+                raise HTTPException(403, PRIVATE_ERROR)
+            if data["model"] == "o3":
+                raise RuntimeError(PRIVATE_ERROR)
+            return await self.echo(data, token, lease=lease)
+
+        self.process.side_effect = forbidden
+        await self.probe({"account_ids": [A], "models": ["gpt-5", "o3", MODEL]})
+        row = self.account()
+        self.assertEqual(row["probe"]["status"], "completed")
+        self.assertEqual(row["unavailable_models"], ["gpt-5"])
+        self.assertEqual(row["available_models"], [MODEL])
+        self.assertEqual((row["checks"]["gpt-5"]["status"], row["checks"]["gpt-5"]["error_code"]), ("denied", "http_403"))
+        self.assertEqual((row["checks"]["o3"]["status"], row["checks"]["o3"]["error_code"]), ("error", "check_failed"))
+        self.assertNotIn(PRIVATE_ERROR, json.dumps(row))
+
+    async def test_probe_state_survives_restart_and_active_job_becomes_interrupted(self):
+        path = Path(self.directory.name) / "model_catalog.json"
+        tokens = {group["token"]: key for key, group in self.quota.groups.items()}
+        make = lambda: ModelCatalog(lambda: tuple(tokens), fetcher=self.fetch, identity_resolver=tokens.__getitem__,
+                                    cache_path=path, clock=self.clock)
+        first = make()
+        first.record_model_check(A, "gpt-5", "denied", sent_model="gpt-5", http_status=403, error_code="http_403")
+        first.set_probe_state(A, status="running", total=3, done=1, current="o3", models=["gpt-5", "o3", MODEL],
+                              results={"gpt-5": "denied"}, private="must not persist")
+        self.assertNotIn("must not persist", path.read_text(encoding="utf-8"))
+        restarted = make().get_account_catalogs()["accounts"]
+        row = next(item for item in restarted if item["account_id"] == A)
+        self.assertEqual((row["probe"]["status"], row["probe"]["stop_reason"], row["probe"]["current"]),
+                         ("stopped", "interrupted", None))
+        self.assertEqual(row["probe"]["done"], 1)
+        self.assertEqual(row["checks"]["gpt-5"]["error_code"], "http_403")
+        self.assertEqual(row["unavailable_models"], ["gpt-5"])
 
 
 if __name__ == "__main__":
